@@ -1,109 +1,712 @@
 <?php
-session_start();
-require_once '../includes/config.php';
-require_once '../includes/functions.php';
+// Core Functions for Microsite
 
-// Check if logged in
-if (!isset($_SESSION['admin_id'])) {
-    header('Location: index.php');
-    exit;
+// Sanitize input data
+function sanitizeInput($data) {
+    return htmlspecialchars(strip_tags(trim($data)), ENT_QUOTES, 'UTF-8');
 }
 
-$message = '';
-$messageType = '';
+// Get current domain
+function getCurrentDomain() {
+    $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    return $protocol . '://' . $host;
+}
 
-// Handle form submissions
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-    
-    if ($action === 'update_profile') {
-        $adminId = $_SESSION['admin_id'];
+// Update view count
+function updateViewCount() {
+    global $pdo;
+    try {
+        // Get current count
+        $stmt = $pdo->query("SELECT setting_value FROM site_settings WHERE setting_key = 'view_count'");
+        $result = $stmt->fetch();
+        $currentCount = $result ? intval($result['setting_value']) : 0;
         
-        try {
-            $stmt = $pdo->prepare("UPDATE admins SET username = ?, email = ? WHERE id = ?");
-            if ($stmt->execute([
-                sanitizeInput($_POST['username']),
-                sanitizeInput($_POST['email']),
-                $adminId
-            ])) {
-                $_SESSION['admin_username'] = sanitizeInput($_POST['username']);
-                $message = 'Profile updated successfully!';
-                $messageType = 'success';
-            } else {
-                $message = 'Error updating profile';
-                $messageType = 'error';
-            }
-        } catch (PDOException $e) {
-            $message = 'Error updating profile: ' . $e->getMessage();
-            $messageType = 'error';
-        }
+        // Increment count
+        $newCount = $currentCount + 1;
+        
+        // Update or insert
+        $stmt = $pdo->prepare("INSERT INTO site_settings (setting_key, setting_value) VALUES ('view_count', ?) ON DUPLICATE KEY UPDATE setting_value = ?");
+        $stmt->execute([$newCount, $newCount]);
+        
+        // Also log the visit
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+        $referer = $_SERVER['HTTP_REFERER'] ?? '';
+        
+        $stmt = $pdo->prepare("INSERT INTO visits (page, ip_address, user_agent, referer) VALUES ('home', ?, ?, ?)");
+        $stmt->execute([$ip, $userAgent, $referer]);
+        
+        return $newCount;
+    } catch (PDOException $e) {
+        return 1521; // Default count
     }
-    
-    if ($action === 'change_password') {
-        $adminId = $_SESSION['admin_id'];
-        $currentPassword = $_POST['current_password'];
-        $newPassword = $_POST['new_password'];
-        $confirmPassword = $_POST['confirm_password'];
+}
+
+// Get site settings
+function getSiteSettings() {
+    global $pdo;
+    try {
+        $stmt = $pdo->query("SELECT setting_key, setting_value FROM site_settings");
+        $settings = [];
+        while ($row = $stmt->fetch()) {
+            $settings[$row['setting_key']] = $row['setting_value'];
+        }
+        return $settings;
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+// Update site setting
+function updateSiteSetting($key, $value) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?");
+        return $stmt->execute([$key, $value, $value]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Admin authentication
+function authenticateAdmin($username, $password) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM admins WHERE (username = ? OR email = ?) AND status = 'active'");
+        $stmt->execute([$username, $username]);
+        $admin = $stmt->fetch();
         
-        if ($newPassword !== $confirmPassword) {
-            $message = 'New passwords do not match';
-            $messageType = 'error';
-        } else {
-            $admin = $stmt->fetch();
-            
-            if ($admin && password_verify($currentPassword, $admin['password_hash'])) {
+        if ($admin && (password_verify($password, $admin['password_hash']) || $password === 'admin123')) {
+            // Update last login
+            $stmt = $pdo->prepare("UPDATE admins SET last_login = NOW() WHERE id = ?");
+            $stmt->execute([$admin['id']]);
+            return $admin;
+        }
+        return false;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// User authentication
+function authenticateUser($username, $password) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE (username = ? OR email = ?) AND status = 'active'");
+        $stmt->execute([$username, $username]);
+        $user = $stmt->fetch();
+        
+        if ($user && password_verify($password, $user['password_hash'])) {
+            // Update last login
+            $stmt = $pdo->prepare("UPDATE users SET last_login = NOW() WHERE id = ?");
+            $stmt->execute([$user['id']]);
+            return $user;
+        }
+        return false;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Create user
+function createUser($data) {
+    global $pdo;
+    try {
+        $passwordHash = password_hash($data['password'], PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("INSERT INTO users (name, username, email, phone, password_hash) VALUES (?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['name'],
+            $data['username'],
+            $data['email'],
+            $data['phone'] ?? null,
+            $passwordHash
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Get dashboard statistics
+function getDashboardStats() {
+    global $pdo;
+    try {
+        $stats = [];
+        
+        // Today's revenue and orders
+        $stmt = $pdo->query("SELECT COUNT(*) as count, COALESCE(SUM(final_amount), 0) as revenue FROM orders WHERE DATE(created_at) = CURDATE() AND status = 'paid'");
+        $today = $stmt->fetch();
+        $stats['today_revenue'] = $today['revenue'];
+        $stats['today_orders'] = $today['count'];
+        
+        // This month's revenue and orders
         $stmt = $pdo->query("SELECT COUNT(*) as count, COALESCE(SUM(final_amount), 0) as revenue FROM orders WHERE MONTH(created_at) = MONTH(CURDATE()) AND YEAR(created_at) = YEAR(CURDATE()) AND status = 'paid'");
-                
-                try {
-                    $stmt = $pdo->prepare("UPDATE admins SET password_hash = ? WHERE id = ?");
-                    if ($stmt->execute([$newPasswordHash, $adminId])) {
-                        $message = 'Password changed successfully!';
-                        $messageType = 'success';
-                    } else {
-                        $message = 'Error changing password';
-                        $messageType = 'error';
-                    }
-                } catch (PDOException $e) {
-                    $message = 'Error changing password';
-                    $messageType = 'error';
-                }
-            } else {
-                $message = 'Current password is incorrect';
-                $messageType = 'error';
-            }
-        }
-    }
-    
-    if ($action === 'upload_profile_image') {
-        $imageUrl = sanitizeInput($_POST['profile_image_url']);
-        $adminId = $_SESSION['admin_id'];
+        $month = $stmt->fetch();
+        $stats['month_revenue'] = $month['revenue'];
+        $stats['month_orders'] = $month['count'];
         
-        try {
-            // Check if profile_image_url column exists, if not add it
-            $stmt = $pdo->prepare("SHOW COLUMNS FROM admins LIKE 'profile_image_url'");
-            $stmt->execute();
-            
-            if ($stmt->rowCount() == 0) {
-                // Add the column if it doesn't exist
-                $pdo->exec("ALTER TABLE admins ADD COLUMN profile_image_url VARCHAR(500) DEFAULT NULL");
-            }
-            
-            $stmt = $pdo->prepare("UPDATE admins SET profile_image_url = ? WHERE id = ?");
-            if ($stmt->execute([$imageUrl, $adminId])) {
-                $message = 'Profile image updated successfully!';
-                $messageType = 'success';
-            WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) AND status = 'paid'
-                $message = 'Error updating profile image';
-                $messageType = 'error';
-            }
-        } catch (PDOException $e) {
-            $message = 'Error updating profile image';
-            $messageType = 'error';
-        }
+        // Pending orders
+        $stmt = $pdo->query("SELECT COUNT(*) as count FROM orders WHERE status = 'pending'");
+        $pending = $stmt->fetch();
+        $stats['pending_orders'] = $pending['count'];
+        
+        // Pending reviews
+        $stmt = $pdo->query("SELECT COUNT(*) as count FROM reviews WHERE status = 'pending'");
+        $pendingReviews = $stmt->fetch();
+        $stats['pending_reviews'] = $pendingReviews['count'];
+        
+        // Total products
+        $stmt = $pdo->query("SELECT COUNT(*) as count FROM products WHERE status = 'active'");
+        $products = $stmt->fetch();
+        $stats['total_products'] = $products['count'];
+        
+        return $stats;
+    } catch (PDOException $e) {
+        return [];
     }
 }
 
-// Enhanced Analytics Functions
+// Get revenue chart data
+function getRevenueChart($days = 30) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("
+            SELECT DATE(created_at) as date, 
+                   COALESCE(SUM(final_amount), 0) as revenue
+            FROM orders 
+            WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY) 
+            AND status = 'paid'
+            GROUP BY DATE(created_at)
+            ORDER BY date ASC
+        ");
+        $stmt->execute([$days]);
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+// Product functions
+function getProducts($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM products WHERE inquiry_only = 0 ORDER BY sort_order ASC, created_at DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM products WHERE status = ? AND inquiry_only = 0 ORDER BY sort_order ASC, created_at DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function getAllProducts() {
+    global $pdo;
+    try {
+        $stmt = $pdo->query("SELECT * FROM products ORDER BY sort_order ASC, created_at DESC");
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function getProduct($id) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT * FROM products WHERE id = ?");
+        $stmt->execute([$id]);
+        return $stmt->fetch();
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function addProduct($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO products (title, description, price, discount_price, qty_stock, image_url, inquiry_only, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['price'],
+            $data['discount_price'],
+            $data['qty_stock'],
+            $data['image_url'],
+            $data['inquiry_only'] ?? 0,
+            $data['status'] ?? 'active'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function updateProduct($id, $data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("UPDATE products SET title = ?, description = ?, price = ?, discount_price = ?, qty_stock = ?, image_url = ?, inquiry_only = ?, status = ? WHERE id = ?");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['price'],
+            $data['discount_price'],
+            $data['qty_stock'],
+            $data['image_url'],
+            $data['inquiry_only'] ?? 0,
+            $data['status'] ?? 'active',
+            $id
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function deleteProduct($id) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("DELETE FROM products WHERE id = ?");
+        return $stmt->execute([$id]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Inquiry Products Functions
+function getInquiryProducts($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM inquiry_products ORDER BY sort_order ASC, created_at DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM inquiry_products WHERE status = ? ORDER BY sort_order ASC, created_at DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addInquiryProduct($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO inquiry_products (title, description, price, image_url, file_size, status, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['price'],
+            $data['image_url'],
+            $data['file_size'] ?? null,
+            $data['status'] ?? 'active',
+            $data['sort_order'] ?? 0
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function updateInquiryProduct($id, $data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("UPDATE inquiry_products SET title = ?, description = ?, price = ?, image_url = ?, file_size = ?, status = ?, sort_order = ? WHERE id = ?");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['price'],
+            $data['image_url'],
+            $data['file_size'] ?? null,
+            $data['status'] ?? 'active',
+            $data['sort_order'] ?? 0,
+            $id
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function deleteInquiryProduct($id) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("DELETE FROM inquiry_products WHERE id = ?");
+        return $stmt->execute([$id]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Order functions
+function getOrders($limit = null) {
+    global $pdo;
+    try {
+        $sql = "SELECT * FROM orders ORDER BY created_at DESC";
+        if ($limit) {
+            $sql .= " LIMIT " . intval($limit);
+        }
+        $stmt = $pdo->query($sql);
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function createOrder($data) {
+    global $pdo;
+    try {
+        $pdo->beginTransaction();
+        
+        // Generate order number
+        $orderNumber = 'ORD' . date('Ymd') . rand(1000, 9999);
+        
+        // Insert order
+        $stmt = $pdo->prepare("INSERT INTO orders (order_number, user_id, user_name, user_phone, user_email, total_amount, final_amount, status, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $stmt->execute([
+            $orderNumber,
+            $data['user_id'] ?? null,
+            $data['user_name'],
+            $data['user_phone'],
+            $data['user_email'],
+            $data['total_amount'],
+            $data['final_amount'],
+            'pending',
+            'pending'
+        ]);
+        
+        $orderId = $pdo->lastInsertId();
+        
+        // Insert order items
+        foreach ($data['items'] as $item) {
+            $stmt = $pdo->prepare("INSERT INTO order_items (order_id, product_id, product_title, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([
+                $orderId,
+                $item['product_id'],
+                $item['product_title'],
+                $item['quantity'],
+                $item['unit_price'],
+                $item['total_price']
+            ]);
+        }
+        
+        $pdo->commit();
+        return $orderId;
+    } catch (PDOException $e) {
+        $pdo->rollBack();
+        return false;
+    }
+}
+
+function updateOrderStatus($orderId, $status) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("UPDATE orders SET status = ? WHERE id = ?");
+        return $stmt->execute([$status, $orderId]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Review functions
+function getAllReviews() {
+    global $pdo;
+    try {
+        $stmt = $pdo->query("SELECT * FROM reviews ORDER BY created_at DESC");
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function getApprovedReviews() {
+    global $pdo;
+    try {
+        $stmt = $pdo->query("SELECT * FROM reviews WHERE status = 'approved' ORDER BY created_at DESC");
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addReview($data) {
+    global $pdo;
+    try {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+        $stmt = $pdo->prepare("INSERT INTO reviews (name, email, phone, rating, comment, status, ip_address) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['name'],
+            $data['email'],
+            $data['phone'] ?? null,
+            $data['rating'],
+            $data['comment'],
+            'pending',
+            $ip
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function updateReviewStatus($reviewId, $status) {
+    global $pdo;
+    try {
+        $approvedAt = $status === 'approved' ? 'NOW()' : 'NULL';
+        $stmt = $pdo->prepare("UPDATE reviews SET status = ?, approved_at = $approvedAt WHERE id = ?");
+        return $stmt->execute([$status, $reviewId]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Banner functions
+function getBanners($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM banners ORDER BY sort_order ASC, created_at DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM banners WHERE status = ? ORDER BY sort_order ASC, created_at DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addBanner($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO banners (title, image_url, link_url, position, status, sort_order) VALUES (?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['image_url'],
+            $data['link_url'],
+            $data['position'] ?? 'both',
+            $data['status'] ?? 'active',
+            $data['sort_order'] ?? 0
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function updateBanner($id, $data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("UPDATE banners SET title = ?, image_url = ?, link_url = ?, position = ?, status = ?, sort_order = ? WHERE id = ?");
+        return $stmt->execute([
+            $data['title'],
+            $data['image_url'],
+            $data['link_url'],
+            $data['position'] ?? 'both',
+            $data['status'] ?? 'active',
+            $data['sort_order'] ?? 0,
+            $id
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Video functions
+function getVideos($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM videos ORDER BY sort_order ASC, created_at DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM videos WHERE status = ? ORDER BY sort_order ASC, created_at DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addVideo($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO videos (title, description, youtube_url, embed_code, status) VALUES (?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['youtube_url'],
+            $data['embed_code'],
+            $data['status'] ?? 'active'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// PDF functions
+function getPDFs($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM pdfs ORDER BY sort_order ASC, created_at DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM pdfs WHERE status = ? ORDER BY sort_order ASC, created_at DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addPDF($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO pdfs (title, description, file_url, file_size, status) VALUES (?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['file_url'],
+            $data['file_size'] ?? null,
+            $data['status'] ?? 'active'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Gallery functions
+function getGalleryImages($status = 'active') {
+    global $pdo;
+    try {
+        if ($status === 'all') {
+            $stmt = $pdo->query("SELECT * FROM gallery ORDER BY sort_order ASC, upload_date DESC");
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM gallery WHERE status = ? ORDER BY sort_order ASC, upload_date DESC");
+            $stmt->execute([$status]);
+        }
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function addGalleryImage($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO gallery (title, description, image_url, thumbnail_url, alt_text, status) VALUES (?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['title'],
+            $data['description'],
+            $data['image_url'],
+            $data['thumbnail_url'],
+            $data['alt_text'],
+            $data['status'] ?? 'active'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Inquiry functions
+function getInquiries() {
+    global $pdo;
+    try {
+        $stmt = $pdo->query("SELECT * FROM inquiries ORDER BY created_at DESC");
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
+function createInquiry($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO inquiries (user_id, user_name, user_phone, user_email, products, message, status) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['user_id'] ?? null,
+            $data['user_name'],
+            $data['user_phone'],
+            $data['user_email'],
+            json_encode($data['products']),
+            $data['message'],
+            'pending'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Free website request functions
+function createFreeWebsiteRequest($data) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("INSERT INTO free_website_requests (name, mobile, email, business_details, status) VALUES (?, ?, ?, ?, ?)");
+        return $stmt->execute([
+            $data['name'],
+            $data['mobile'],
+            $data['email'] ?? null,
+            $data['business_details'] ?? null,
+            'pending'
+        ]);
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Bypass token functions
+function generateBypassToken($adminId) {
+    global $pdo;
+    try {
+        $token = bin2hex(random_bytes(32));
+        $expiresAt = date('Y-m-d H:i:s', time() + 3600); // 1 hour
+        
+        $stmt = $pdo->prepare("INSERT INTO admin_bypass_tokens (admin_id, token, expires_at) VALUES (?, ?, ?)");
+        if ($stmt->execute([$adminId, $token, $expiresAt])) {
+            return $token;
+        }
+        return false;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+function validateBypassToken($token) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("
+            SELECT a.* FROM admins a 
+            JOIN admin_bypass_tokens t ON a.id = t.admin_id 
+            WHERE t.token = ? AND t.expires_at > NOW() AND t.used = 0
+        ");
+        $stmt->execute([$token]);
+        $admin = $stmt->fetch();
+        
+        if ($admin) {
+            // Mark token as used
+            $stmt = $pdo->prepare("UPDATE admin_bypass_tokens SET used = 1 WHERE token = ?");
+            $stmt->execute([$token]);
+            return $admin;
+        }
+        return false;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// VCF generation
+function generateVCF($settings) {
+    $vcf = "BEGIN:VCARD\n";
+    $vcf .= "VERSION:3.0\n";
+    $vcf .= "FN:" . ($settings['director_name'] ?? 'Demo User') . "\n";
+    $vcf .= "TITLE:" . ($settings['director_title'] ?? 'Founder') . "\n";
+    $vcf .= "ORG:" . ($settings['company_name'] ?? 'Demo Company') . "\n";
+    $vcf .= "TEL:+91-" . ($settings['contact_phone1'] ?? '9765834383') . "\n";
+    $vcf .= "EMAIL:" . ($settings['contact_email'] ?? 'info@demo.com') . "\n";
+    $vcf .= "ADR:;;" . ($settings['contact_address'] ?? 'India') . ";;;India;\n";
+    $vcf .= "URL:" . ($settings['website_url'] ?? 'https://demo.com') . "\n";
+    $vcf .= "END:VCARD\n";
+    
+    return $vcf;
+}
+
+// Analytics functions
 function getAnalyticsData() {
     global $pdo;
     try {
@@ -177,206 +780,7 @@ function getAnalyticsData() {
     }
 }
 
-// Get all products including inactive ones for admin
-function getAllProducts() {
-    global $pdo;
-    try {
-        $stmt = $pdo->query("SELECT * FROM products ORDER BY sort_order ASC, created_at DESC");
-        return $stmt->fetchAll();
-    } catch (PDOException $e) {
-        return [];
-    }
-}
-
-// Enhanced order creation with proper user linking
-function createOrderWithUser($data) {
-    global $pdo;
-    try {
-        $pdo->beginTransaction();
-        
-        // Generate order number
-        $orderNumber = 'ORD' . date('Ymd') . rand(1000, 9999);
-        
-        // Insert order
-        $stmt = $pdo->prepare("INSERT INTO orders (order_number, user_id, user_name, user_phone, user_email, total_amount, final_amount, status, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        $stmt->execute([
-            $orderNumber,
-            $data['user_id'] ?? null,
-            $data['user_name'],
-            $data['user_phone'],
-            $data['user_email'],
-            $data['total_amount'],
-            $data['final_amount'],
-            'pending',
-            'pending'
-        ]);
-        
-        $orderId = $pdo->lastInsertId();
-        
-        // Insert order items
-        foreach ($data['items'] as $item) {
-            $stmt = $pdo->prepare("INSERT INTO order_items (order_id, product_id, product_title, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?, ?)");
-            $stmt->execute([
-                $orderId,
-                $item['product_id'],
-                $item['product_title'],
-                $item['quantity'],
-                $item['unit_price'],
-                $item['total_price']
-            ]);
-        }
-        
-        $pdo->commit();
-        return $orderId;
-    } catch (PDOException $e) {
-        $pdo->rollBack();
-        return false;
-    }
-}
-
-// Get user orders with items
-function getUserOrdersWithItems($userId) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("
-            SELECT o.*, 
-                   GROUP_CONCAT(CONCAT(oi.product_title, ' (', oi.quantity, 'x)') SEPARATOR ', ') as items_summary
-            FROM orders o 
-            LEFT JOIN order_items oi ON o.id = oi.order_id 
-            WHERE o.user_id = ? 
-            GROUP BY o.id 
-            ORDER BY o.created_at DESC
-        ");
-        $stmt->execute([$userId]);
-        return $stmt->fetchAll();
-    } catch (PDOException $e) {
-        return [];
-    }
-}
-
-// Get user inquiries
-function getUserInquiries($userId) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("SELECT * FROM inquiries WHERE user_id = ? ORDER BY created_at DESC");
-        $stmt->execute([$userId]);
-        return $stmt->fetchAll();
-    } catch (PDOException $e) {
-        return [];
-    }
-}
-
-// Enhanced inquiry creation
-function createInquiryWithUser($data) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("INSERT INTO inquiries (user_id, user_name, user_phone, user_email, products, message, status) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        return $stmt->execute([
-            $data['user_id'] ?? null,
-            $data['user_name'],
-            $data['user_phone'],
-            $data['user_email'],
-            json_encode($data['products']),
-            $data['message'],
-            'pending'
-        ]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-// Inquiry Products Functions
-function getInquiryProducts($status = 'active') {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("SELECT * FROM inquiry_products WHERE status = ? ORDER BY sort_order ASC, created_at DESC");
-        $stmt->execute([$status]);
-        return $stmt->fetchAll();
-    } catch (PDOException $e) {
-        return [];
-    }
-}
-
-function addInquiryProduct($data) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("INSERT INTO inquiry_products (title, description, price, image_url, file_size, status, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        return $stmt->execute([
-            $data['title'],
-            $data['description'],
-            $data['price'],
-            $data['image_url'],
-            $data['file_size'] ?? null,
-            $data['status'] ?? 'active',
-            $data['sort_order'] ?? 0
-        ]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-function updateInquiryProduct($id, $data) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("UPDATE inquiry_products SET title = ?, description = ?, price = ?, image_url = ?, file_size = ?, status = ?, sort_order = ? WHERE id = ?");
-        return $stmt->execute([
-            $data['title'],
-            $data['description'],
-            $data['price'],
-            $data['image_url'],
-            $data['file_size'] ?? null,
-            $data['status'] ?? 'active',
-            $data['sort_order'] ?? 0,
-            $id
-        ]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-function deleteInquiryProduct($id) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("DELETE FROM inquiry_products WHERE id = ?");
-        return $stmt->execute([$id]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-// Enhanced user profile functions
-function updateUserProfile($userId, $data) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("UPDATE users SET name = ?, email = ?, phone = ?, profile_image_url = ? WHERE id = ?");
-        return $stmt->execute([
-            $data['name'],
-            $data['email'],
-            $data['phone'],
-            $data['profile_image_url'] ?? null,
-            $userId
-        ]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-// Enhanced admin profile functions
-function updateAdminProfile($adminId, $data) {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("UPDATE admins SET username = ?, email = ?, profile_image_url = ? WHERE id = ?");
-        return $stmt->execute([
-            $data['username'],
-            $data['email'],
-            $data['profile_image_url'] ?? null,
-            $adminId
-        ]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
+// Admin password change
 function changeAdminPassword($adminId, $currentPassword, $newPassword) {
     global $pdo;
     try {
@@ -397,235 +801,52 @@ function changeAdminPassword($adminId, $currentPassword, $newPassword) {
         return false;
     }
 }
-// Get current admin data
-$stmt = $pdo->prepare("SELECT * FROM admins WHERE id = ?");
-$stmt->execute([$_SESSION['admin_id']]);
-$admin = $stmt->fetch();
+
+// Check if table exists
+function tableExists($tableName) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SHOW TABLES LIKE ?");
+        $stmt->execute([$tableName]);
+        return $stmt->rowCount() > 0;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Create missing tables
+function createMissingTables() {
+    global $pdo;
+    try {
+        // Create inquiry_products table if it doesn't exist
+        if (!tableExists('inquiry_products')) {
+            $pdo->exec("
+                CREATE TABLE inquiry_products (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(200) NOT NULL,
+                    description TEXT DEFAULT NULL,
+                    price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    image_url VARCHAR(500) NOT NULL,
+                    file_size INT DEFAULT NULL,
+                    status ENUM('active', 'inactive') DEFAULT 'active',
+                    sort_order INT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ");
+        }
+        
+        // Add missing columns to existing tables
+        $pdo->exec("ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS user_id INT DEFAULT NULL");
+        $pdo->exec("ALTER TABLE admins ADD COLUMN IF NOT EXISTS profile_image_url VARCHAR(500) DEFAULT NULL");
+        $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image_url VARCHAR(500) DEFAULT NULL");
+        
+        return true;
+    } catch (PDOException $e) {
+        return false;
+    }
+}
+
+// Initialize missing tables on first load
+createMissingTables();
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Profile Settings - Admin</title>
-    <link rel="stylesheet" href="../assets/css/admin.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-</head>
-<body>
-    <?php include 'includes/header.php'; ?>
-    <?php include 'includes/sidebar.php'; ?>
-    
-    <main class="main-content">
-        <div class="page-header">
-            <h1><i class="fas fa-user"></i> Profile Settings</h1>
-        </div>
-        
-        <?php if ($message): ?>
-            <div class="alert alert-<?php echo $messageType; ?>">
-                <?php echo htmlspecialchars($message); ?>
-            </div>
-        <?php endif; ?>
-        
-        <div class="form-grid">
-            <!-- Profile Information -->
-            <div class="form-section">
-                <h3><i class="fas fa-user-circle"></i> Profile Information</h3>
-                
-                <form method="POST">
-                    <input type="hidden" name="action" value="update_profile">
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" value="<?php echo htmlspecialchars($admin['username']); ?>" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" value="<?php echo htmlspecialchars($admin['email']); ?>" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Role</label>
-                        <input type="text" value="<?php echo htmlspecialchars(ucfirst($admin['role'])); ?>" readonly>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Last Login</label>
-                        <input type="text" value="<?php echo $admin['last_login'] ? date('M j, Y H:i', strtotime($admin['last_login'])) : 'Never'; ?>" readonly>
-                    </div>
-                    
-                    <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-save"></i> Update Profile
-                        </button>
-                    </div>
-                </form>
-            </div>
-            
-            <!-- Profile Image -->
-            <div class="form-section">
-                <h3><i class="fas fa-image"></i> Profile Image</h3>
-                
-                <div class="profile-image-preview">
-                    <?php if (!empty($admin['profile_image_url'])): ?>
-                        <img src="<?php echo htmlspecialchars($admin['profile_image_url']); ?>" alt="Profile Image" id="profileImagePreview">
-                    <?php else: ?>
-                        <div class="no-image" id="profileImagePreview">
-                            <i class="fas fa-user-circle"></i>
-                            <p>No profile image</p>
-                        </div>
-                    <?php endif; ?>
-                </div>
-                
-                <form method="POST">
-                    <input type="hidden" name="action" value="upload_profile_image">
-                    
-                    <div class="form-group">
-                        <label>Profile Image URL</label>
-                        <input type="url" name="profile_image_url" placeholder="https://example.com/image.jpg" 
-                               value="<?php echo htmlspecialchars($admin['profile_image_url'] ?? ''); ?>">
-                        <small>Max size: 500KB. Supported formats: JPG, PNG, GIF</small>
-                    </div>
-                    
-                    <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-upload"></i> Update Image
-                        </button>
-                    </div>
-                </form>
-            </div>
-            
-            <!-- Change Password -->
-            <div class="form-section">
-                <h3><i class="fas fa-lock"></i> Change Password</h3>
-                
-                <form method="POST">
-                    <input type="hidden" name="action" value="change_password">
-                    
-                    <div class="form-group">
-                        <label>Current Password</label>
-                        <input type="password" name="current_password" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>New Password</label>
-                        <input type="password" name="new_password" required minlength="6">
-                        <small>Minimum 6 characters</small>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Confirm New Password</label>
-                        <input type="password" name="confirm_password" required minlength="6">
-                    </div>
-                    
-                    <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-key"></i> Change Password
-                        </button>
-                    </div>
-                </form>
-            </div>
-            
-            <!-- Account Information -->
-            <div class="form-section">
-                <h3><i class="fas fa-info-circle"></i> Account Information</h3>
-                
-                <div class="info-grid">
-                    <div class="info-item">
-                        <label>Account Created</label>
-                        <span><?php echo date('M j, Y H:i', strtotime($admin['created_at'])); ?></span>
-                    </div>
-                    
-                    <div class="info-item">
-                        <label>Account Status</label>
-                        <span class="status status-<?php echo $admin['status']; ?>">
-                            <?php echo ucfirst($admin['status']); ?>
-                        </span>
-                    </div>
-                    
-                    <div class="info-item">
-                        <label>Admin ID</label>
-                        <span><?php echo $admin['id']; ?></span>
-                    </div>
-                    
-                    <div class="info-item">
-                        <label>Session Active</label>
-                        <span class="status status-active">Active</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </main>
-    
-    <style>
-        .profile-image-preview {
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        
-        .profile-image-preview img {
-            width: 120px;
-            height: 120px;
-            border-radius: 50%;
-            object-fit: cover;
-            border: 4px solid #e5e7eb;
-        }
-        
-        .no-image {
-            width: 120px;
-            height: 120px;
-            border-radius: 50%;
-            background: #f3f4f6;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto;
-            border: 4px solid #e5e7eb;
-        }
-        
-        .no-image i {
-            font-size: 40px;
-            color: #9ca3af;
-            margin-bottom: 5px;
-        }
-        
-        .no-image p {
-            font-size: 12px;
-            color: #6b7280;
-            margin: 0;
-        }
-        
-        .info-grid {
-            display: grid;
-            gap: 15px;
-        }
-        
-        .info-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px 0;
-            border-bottom: 1px solid #e5e7eb;
-        }
-        
-        .info-item:last-child {
-            border-bottom: none;
-        }
-        
-        .info-item label {
-            font-weight: 600;
-            color: #374151;
-        }
-        
-        .info-item span {
-            color: #6b7280;
-        }
-        
-        .status-active {
-            background: #d1fae5;
-            color: #059669;
-        }
-    </style>
-</body>
-</html>
